@@ -2,6 +2,7 @@
     "model_cfg": {
         "embed_dim": 1024,
         "quick_gelu": true,
+        "nonscalar_logit_scale": true,
         "vision_cfg": {
             "image_size": 378,
             "layers": 32,
