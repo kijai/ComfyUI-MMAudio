@@ -269,7 +269,13 @@ class MMAudioFeatureUtilsLoader:
              clip_config = json.load(f)
             
         with init_empty_weights():
-            clip_model = CLIP(**clip_config["model_cfg"]).eval()
+            try:
+                clip_model = CLIP(**clip_config["model_cfg"]).eval()
+            except:
+                # for some open-clip versions
+                clip_config["model_cfg"]["nonscalar_logit_scale"] = True
+                clip_model = CLIP(**clip_config["model_cfg"]).eval()
+
         clip_sd = load_torch_file(os.path.join(clip_model_path), device=offload_device)
         for name, param in clip_model.named_parameters():
             set_module_tensor_to_device(clip_model, name, device=device, dtype=dtype, value=clip_sd[name])
