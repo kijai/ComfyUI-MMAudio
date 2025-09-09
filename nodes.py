@@ -153,7 +153,7 @@ class MMAudioModelLoader:
                     latent_seq_len=345,
                     clip_seq_len=64,
                     sync_seq_len=192,
-                    v2=True
+                    v2=not ("nsfw" in mmaudio_model)
                     )
         model = model.eval().to(device=device, dtype=base_dtype)
         model.load_weights(mmaudio_sd)
