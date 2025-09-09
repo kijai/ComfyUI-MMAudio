@@ -14,7 +14,6 @@ script_directory = os.path.dirname(os.path.abspath(__file__))
 if not "mmaudio" in folder_paths.folder_names_and_paths:
     folder_paths.add_model_folder_path("mmaudio", os.path.join(folder_paths.models_dir, "mmaudio"))
 
-
 from .mmaudio.eval_utils import generate
 from .mmaudio.model.flow_matching import FlowMatching
 from .mmaudio.model.networks import MMAudio
@@ -125,45 +124,50 @@ class MMAudioModelLoader:
         mmaudio_model_path = folder_paths.get_full_path_or_raise("mmaudio", mmaudio_model)
         mmaudio_sd = load_torch_file(mmaudio_model_path, device=offload_device)
 
-        if "small" in mmaudio_model:
-            num_heads = 7
-            model = MMAudio(
-                    latent_dim=40,
-                    clip_dim=1024,
-                    sync_dim=768,
-                    text_dim=1024,
-                    hidden_dim=64 * num_heads,
-                    depth=12,
-                    fused_depth=8,
-                    num_heads=num_heads,
-                    latent_seq_len=345,
-                    clip_seq_len=64,
-                    sync_seq_len=192
-                    )
-        elif "large" in mmaudio_model:
-            num_heads = 14
-            model = MMAudio(latent_dim=40,
-                    clip_dim=1024,
-                    sync_dim=768,
-                    text_dim=1024,
-                    hidden_dim=64 * num_heads,
-                    depth=21,
-                    fused_depth=14,
-                    num_heads=num_heads,
-                    latent_seq_len=345,
-                    clip_seq_len=64,
-                    sync_seq_len=192,
-                    v2=True
-                    )
-        model = model.eval().to(device=device, dtype=base_dtype)
-        model.load_weights(mmaudio_sd)
+        with init_empty_weights():
+            # small
+            if mmaudio_sd["audio_input_proj.0.bias"].shape[0] == 448:
+                num_heads = 7
+                model = MMAudio(
+                        latent_dim=40,
+                        clip_dim=1024,
+                        sync_dim=768,
+                        text_dim=1024,
+                        hidden_dim=64 * num_heads,
+                        depth=12,
+                        fused_depth=8,
+                        num_heads=num_heads,
+                        latent_seq_len=345,
+                        clip_seq_len=64,
+                        sync_seq_len=192
+                        )
+            # large
+            elif mmaudio_sd["audio_input_proj.0.bias"].shape[0] == 896:
+                num_heads = 14
+                model = MMAudio(latent_dim=40,
+                        clip_dim=1024,
+                        sync_dim=768,
+                        text_dim=1024,
+                        hidden_dim=64 * num_heads,
+                        depth=21,
+                        fused_depth=14,
+                        num_heads=num_heads,
+                        latent_seq_len=345,
+                        clip_seq_len=64,
+                        sync_seq_len=192,
+                        v2=mmaudio_sd["t_embed.mlp.0.weight"].shape[1] == 896
+                        )
+        model = model.eval()
+        for name, param in model.named_parameters():
+            # Set tensor to device
+            set_module_tensor_to_device(model, name, device=device, dtype=base_dtype, value=mmaudio_sd[name])
+        del mmaudio_sd
         log.info(f'Loaded MMAudio model weights from {mmaudio_model_path}')
         if "44" in mmaudio_model:
             model.seq_cfg = CONFIG_44K
         elif "16" in mmaudio_model:
             model.seq_cfg = CONFIG_16K
         
-       
         return (model,)
     
 #region Features Utils
@@ -220,9 +224,12 @@ class MMAudioFeatureUtilsLoader:
         #synchformer
         synchformer_path = folder_paths.get_full_path_or_raise("mmaudio", synchformer_model)
         synchformer_sd = load_torch_file(synchformer_path, device=offload_device)
-        synchformer = Synchformer()
-        synchformer.load_state_dict(synchformer_sd)
-        synchformer = synchformer.eval().to(device=device, dtype=dtype)
+        with init_empty_weights():
+            synchformer = Synchformer().eval()
+        
+        for name, param in synchformer.named_parameters():
+            # Set tensor to device
+            set_module_tensor_to_device(synchformer, name, device=device, dtype=dtype, value=synchformer_sd[name])
 
         #vae
         download_path = folder_paths.get_folder_paths("mmaudio")[0]
