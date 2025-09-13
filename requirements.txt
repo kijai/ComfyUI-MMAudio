@@ -5,3 +5,4 @@ timm>=1.0.8
 omegaconf>=2.3.0
 open_clip_torch>=2.29.0
 accelerate
+ftfy>=6.1.1
