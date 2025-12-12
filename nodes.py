@@ -160,7 +160,7 @@ class MMAudioModelLoader:
         model = model.eval()
         for name, param in model.named_parameters():
             # Set tensor to device
-            set_module_tensor_to_device(model, name, device=device, dtype=base_dtype, value=mmaudio_sd[name])
+            set_module_tensor_to_device(model, name, device=offload_device, dtype=base_dtype, value=mmaudio_sd[name])
         del mmaudio_sd
         log.info(f'Loaded MMAudio model weights from {mmaudio_model_path}')
         if "44" in mmaudio_model:
