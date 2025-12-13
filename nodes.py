@@ -1,7 +1,6 @@
 import os
 import torch
 import json
-from torchvision.transforms import v2
 from accelerate import init_empty_weights
 from accelerate.utils import set_module_tensor_to_device
 
@@ -28,69 +27,116 @@ import logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 log = logging.getLogger(__name__)
 
-def process_video_tensor(video_tensor: torch.Tensor, duration_sec: float) -> tuple[torch.Tensor, torch.Tensor, float]:
+def process_video_tensor(video_tensor: torch.Tensor, duration_sec: float, input_fps: float = None) -> tuple[torch.Tensor, torch.Tensor, float]:
+    """
+    處理影片張量，轉換為 CLIP 和 SYNC 所需格式
+    當影片幀數不足時，會透過時間插值來擴充幀數以匹配指定的 duration
+    
+    Args:
+        video_tensor: 影片張量 (frames, height, width, channels)
+        duration_sec: 期望的音訊時長（秒）
+        input_fps: 輸入影片的幀率（如果為 None 則自動計算）
+    
+    Returns:
+        clip_frames: CLIP 模型用的幀
+        sync_frames: Synchformer 用的幀  
+        actual_duration: 實際使用的時長（秒）
+    """
     _CLIP_SIZE = 384
     _CLIP_FPS = 8.0
-
     _SYNC_SIZE = 224
     _SYNC_FPS = 25.0
+    
+    # Synchformer 的分段參數（與 features_utils.py 保持一致）
+    _SYNC_SEGMENT_SIZE = 16
+    _SYNC_STEP_SIZE = 8
+    _SYNC_DOWNSAMPLE = 2
 
-    clip_transform = v2.Compose([
-        v2.Resize((_CLIP_SIZE, _CLIP_SIZE), interpolation=v2.InterpolationMode.BICUBIC),
-        v2.ToPILImage(),
-        v2.ToTensor(),
-        v2.ConvertImageDtype(torch.float32),
-    ])
-
-    sync_transform = v2.Compose([
-        v2.Resize(_SYNC_SIZE, interpolation=v2.InterpolationMode.BICUBIC),
-        v2.CenterCrop(_SYNC_SIZE),
-        v2.ToPILImage(),
-        v2.ToTensor(),
-        v2.ConvertImageDtype(torch.float32),
-        v2.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
-    ])
-
-    # Assuming video_tensor is in the shape (frames, height, width, channels)
     total_frames = video_tensor.shape[0]
-    clip_frames_count = int(_CLIP_FPS * duration_sec)
-    sync_frames_count = int(_SYNC_FPS * duration_sec)
-
-    # Adjust duration if there are not enough frames
-    if total_frames < clip_frames_count:
-        log.warning(f'Clip video is too short: {total_frames / _CLIP_FPS:.2f} < {duration_sec:.2f}')
-        clip_frames_count = total_frames
-        duration_sec = total_frames / _CLIP_FPS
-
-    if total_frames < sync_frames_count:
-        log.warning(f'Sync video is too short: {total_frames / _SYNC_FPS:.2f} < {duration_sec:.2f}, truncating to {total_frames / _SYNC_FPS:.2f} sec')
-        sync_frames_count = total_frames
-        duration_sec = total_frames / _SYNC_FPS
-
-    clip_frames = video_tensor[:clip_frames_count]
-    sync_frames = video_tensor[:sync_frames_count]
-
-    clip_frames = clip_frames.permute(0, 3, 1, 2)
-    sync_frames = sync_frames.permute(0, 3, 1, 2)
-
-    clip_frames = torch.stack([clip_transform(frame) for frame in clip_frames])
-    sync_frames = torch.stack([sync_transform(frame) for frame in sync_frames])
-
-    clip_length_sec = clip_frames.shape[0] / _CLIP_FPS
-    sync_length_sec = sync_frames.shape[0] / _SYNC_FPS
-
-    # if clip_length_sec < duration_sec:
-    #     log.warning(f'Clip video is too short: {clip_length_sec:.2f} < {duration_sec:.2f}')
-    #     log.warning(f'Truncating to {clip_length_sec:.2f} sec')
-    #     duration_sec = clip_length_sec
-
-    # if sync_length_sec < duration_sec:
-    #     log.warning(f'Sync video is too short: {sync_length_sec:.2f} < {duration_sec:.2f}')
-    #     log.warning(f'Truncating to {sync_length_sec:.2f} sec')
-    #     duration_sec = sync_length_sec
-
-    clip_frames = clip_frames[:int(_CLIP_FPS * duration_sec)]
-    sync_frames = sync_frames[:int(_SYNC_FPS * duration_sec)]
+    
+    # 計算需要的幀數（使用指定的 duration）
+    clip_frames_needed = int(_CLIP_FPS * duration_sec)
+    sync_frames_needed = int(_SYNC_FPS * duration_sec)
+    
+    if input_fps is not None and input_fps > 0:
+        video_actual_duration = total_frames / input_fps
+        log.info(f"輸入影片: {total_frames} 幀 @ {input_fps} fps (實際時長 {video_actual_duration:.2f}s)")
+        log.info(f"目標音訊時長: {duration_sec:.2f}s")
+        log.info(f"需要的幀數: CLIP={clip_frames_needed} @ {_CLIP_FPS} fps, SYNC={sync_frames_needed} @ {_SYNC_FPS} fps")
+    
+    # 提取原始幀並轉換為 NCHW 格式
+    video_frames_nchw = video_tensor.permute(0, 3, 1, 2).contiguous()  # (T, H, W, C) -> (T, C, H, W)
+    
+    # === 處理 CLIP 幀 ===
+    if total_frames < clip_frames_needed:
+        # 需要時間插值來擴充幀數
+        log.info(f"CLIP: 影片幀數 {total_frames} < 需求 {clip_frames_needed}，使用時間插值擴充")
+        # 使用 3D 插值在時間維度擴充
+        # 添加 batch 維度: (T, C, H, W) -> (1, C, T, H, W)
+        video_5d = video_frames_nchw.permute(1, 0, 2, 3).unsqueeze(0)  # (1, C, T, H, W)
+        # 時間插值
+        video_5d_interp = torch.nn.functional.interpolate(
+            video_5d,
+            size=(clip_frames_needed, video_5d.shape[3], video_5d.shape[4]),
+            mode='trilinear',
+            align_corners=False
+        )
+        # 轉回 (T, C, H, W)
+        clip_frames = video_5d_interp.squeeze(0).permute(1, 0, 2, 3)  # (T, C, H, W)
+    else:
+        # 幀數足夠，直接截取
+        clip_frames = video_frames_nchw[:clip_frames_needed]
+    
+    # 空間 resize 到 384x384
+    clip_frames = torch.nn.functional.interpolate(
+        clip_frames, 
+        size=(_CLIP_SIZE, _CLIP_SIZE), 
+        mode='bicubic', 
+        align_corners=False
+    )
+    
+    # === 處理 SYNC 幀 ===
+    if total_frames < sync_frames_needed:
+        # 需要時間插值來擴充幀數
+        log.info(f"SYNC: 影片幀數 {total_frames} < 需求 {sync_frames_needed}，使用時間插值擴充")
+        # 使用 3D 插值在時間維度擴充
+        video_5d = video_frames_nchw.permute(1, 0, 2, 3).unsqueeze(0)  # (1, C, T, H, W)
+        video_5d_interp = torch.nn.functional.interpolate(
+            video_5d,
+            size=(sync_frames_needed, video_5d.shape[3], video_5d.shape[4]),
+            mode='trilinear',
+            align_corners=False
+        )
+        sync_frames = video_5d_interp.squeeze(0).permute(1, 0, 2, 3)  # (T, C, H, W)
+    else:
+        # 幀數足夠，直接截取
+        sync_frames = video_frames_nchw[:sync_frames_needed]
+    
+    # 空間處理：先 resize 到短邊 224，然後 center crop
+    h, w = sync_frames.shape[2], sync_frames.shape[3]
+    if h < w:
+        new_h, new_w = _SYNC_SIZE, int(_SYNC_SIZE * w / h)
+    else:
+        new_h, new_w = int(_SYNC_SIZE * h / w), _SYNC_SIZE
+    
+    sync_frames = torch.nn.functional.interpolate(
+        sync_frames,
+        size=(new_h, new_w),
+        mode='bicubic',
+        align_corners=False
+    )
+    
+    # Center crop
+    top = (new_h - _SYNC_SIZE) // 2
+    left = (new_w - _SYNC_SIZE) // 2
+    sync_frames = sync_frames[:, :, top:top+_SYNC_SIZE, left:left+_SYNC_SIZE]
+    
+    # Normalize sync frames
+    sync_frames = sync_frames * 2.0 - 1.0  # [0, 1] -> [-1, 1]
+    
+    log.info(f"✅ 處理完成: clip={clip_frames.shape[0]} 幀 ({clip_frames.shape[0]/_CLIP_FPS:.2f}s @ {_CLIP_FPS} fps), "
+             f"sync={sync_frames.shape[0]} 幀 ({sync_frames.shape[0]/_SYNC_FPS:.2f}s @ {_SYNC_FPS} fps), "
+             f"音訊時長={duration_sec:.2f}s")
 
     return clip_frames, sync_frames, duration_sec
 
@@ -298,7 +344,7 @@ class MMAudioSampler:
             "required": {
                 "mmaudio_model": ("MMAUDIO_MODEL",),
                 "feature_utils": ("MMAUDIO_FEATUREUTILS",),
-                "duration": ("FLOAT", {"default": 8, "step": 0.01, "tooltip": "Duration of the audio in seconds"}),
+                "duration": ("FLOAT", {"default": 8, "step": 0.01, "tooltip": "期望的音訊時長（秒），實際時長會根據影片幀數自動調整"}),
                 "steps": ("INT", {"default": 25, "step": 1, "tooltip": "Number of steps to interpolate"}),
                 "cfg": ("FLOAT", {"default": 4.5, "step": 0.1, "tooltip": "Strength of the conditioning"}),
                 "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff}),
@@ -309,6 +355,7 @@ class MMAudioSampler:
             },
             "optional": {
                 "images": ("IMAGE",),
+                "input_fps": ("FLOAT", {"default": 16.0, "min": 1.0, "max": 60.0, "step": 0.01, "tooltip": "輸入影片的幀率（fps），用於計算實際時長"}),
             },
         }
 
@@ -317,7 +364,7 @@ class MMAudioSampler:
     FUNCTION = "sample"
     CATEGORY = "MMAudio"
 
-    def sample(self, mmaudio_model, seed, feature_utils, duration, steps, cfg, prompt, negative_prompt, mask_away_clip, force_offload, images=None):
+    def sample(self, mmaudio_model, seed, feature_utils, duration, steps, cfg, prompt, negative_prompt, mask_away_clip, force_offload, images=None, input_fps=16.0):
         device = mm.get_torch_device()
         offload_device = mm.unet_offload_device()
         rng = torch.Generator(device=device)
@@ -327,8 +374,8 @@ class MMAudioSampler:
        
         if images is not None:
             images = images.to(device=device)
-            clip_frames, sync_frames, duration = process_video_tensor(images, duration)
-            print("clip_frames", clip_frames.shape, "sync_frames", sync_frames.shape, "duration", duration)
+            clip_frames, sync_frames, duration = process_video_tensor(images, duration, input_fps)
+            log.info(f"處理結果: clip_frames={clip_frames.shape}, sync_frames={sync_frames.shape}, duration={duration:.2f}s")
             if mask_away_clip:
                 clip_frames = None
             else:
