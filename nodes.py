@@ -28,13 +28,48 @@ import logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 log = logging.getLogger(__name__)
 
-def process_video_tensor(video_tensor: torch.Tensor, duration_sec: float) -> tuple[torch.Tensor, torch.Tensor, float]:
+def process_video_tensor(
+    video_tensor: torch.Tensor,
+    duration_sec: float,
+    target_clip: int | None = None,
+    target_sync: int | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, float]:
+    """
+    Prepare visual tensors for MMAudio.
+
+    - Uniformly resamples over the FULL input span (no front-slice).
+    - Uses exact target counts for CLIP tokens and SYNC TOKENS expected by the model.
+    - IMPORTANT (Synchformer): to GET `target_sync` TOKENS OUT, we must feed
+      `target_sync + 8` RAW FRAMES in. Reason:
+        * segments of 16 frames, stride 8  -> num_segments = floor((N-16)/8) + 1
+        * downsample_rate 2                -> tokens = num_segments * 16 / 2 = num_segments * 8
+        * algebra => tokens ≈ N − 8  (so add 8 to N to hit tokens exactly)
+    - Keeps `duration_sec` unchanged. Any upsampling is handled via duplicated indices.
+
+    Args:
+        video_tensor: (T, H, W, C) float in [0,1], typically on CUDA (ComfyUI IMAGE).
+        duration_sec: Requested audio duration (returned unchanged).
+        target_clip:  Desired CLIP token length (e.g., 64 for 8s, 80 for 10s).
+        target_sync:  Desired SYNC token length (e.g., 192 for 8s, 242 for 10s).
+
+    Returns:
+        clip_frames: (T_clip, 3, 384, 384) float32 in [0,1]
+        sync_frames: (T_sync_raw, 3, 224, 224) float32 normalized to [-1,1]
+                     NOTE: T_sync_raw == target_sync + 8 (by design).
+        duration_sec: unchanged
+    """
     _CLIP_SIZE = 384
-    _CLIP_FPS = 8.0
+    _CLIP_FPS  = 8.0
 
     _SYNC_SIZE = 224
-    _SYNC_FPS = 25.0
+    _SYNC_FPS  = 25.0
 
+    # Synchformer sampling constants from upstream config
+    _SYNC_NUM_FRAMES_PER_SEG = 16
+    _SYNC_STEP_SIZE          = 8
+    _SYNC_OFFSET             = _SYNC_NUM_FRAMES_PER_SEG - _SYNC_STEP_SIZE  # = 8
+
+    # CPU/PIL transforms
     clip_transform = v2.Compose([
         v2.Resize((_CLIP_SIZE, _CLIP_SIZE), interpolation=v2.InterpolationMode.BICUBIC),
         v2.ToPILImage(),
@@ -51,46 +86,40 @@ def process_video_tensor(video_tensor: torch.Tensor, duration_sec: float) -> tup
         v2.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
     ])
 
-    # Assuming video_tensor is in the shape (frames, height, width, channels)
-    total_frames = video_tensor.shape[0]
-    clip_frames_count = int(_CLIP_FPS * duration_sec)
-    sync_frames_count = int(_SYNC_FPS * duration_sec)
+    total_frames = int(video_tensor.shape[0])
+    if total_frames <= 0:
+        raise ValueError("process_video_tensor: input video_tensor has zero frames")
 
-    # Adjust duration if there are not enough frames
-    if total_frames < clip_frames_count:
-        log.warning(f'Clip video is too short: {total_frames / _CLIP_FPS:.2f} < {duration_sec:.2f}')
-        clip_frames_count = total_frames
-        duration_sec = total_frames / _CLIP_FPS
+    # Defaults from duration, if explicit targets aren't provided
+    if target_clip is None:
+        target_clip = max(1, int(_CLIP_FPS * duration_sec))
+    if target_sync is None:
+        # NOTE: this is the TOKEN count; we will fetch raw frames = target_sync + 8
+        target_sync = max(1, int(_SYNC_FPS * duration_sec) - _SYNC_OFFSET)
 
-    if total_frames < sync_frames_count:
-        log.warning(f'Sync video is too short: {total_frames / _SYNC_FPS:.2f} < {duration_sec:.2f}, truncating to {total_frames / _SYNC_FPS:.2f} sec')
-        sync_frames_count = total_frames
-        duration_sec = total_frames / _SYNC_FPS
+    # EVENLY spaced indices helper (same device as source to satisfy index_select)
+    def uniform_indices(n_src: int, n_tgt: int, device: torch.device) -> torch.Tensor:
+        if n_src == 1:
+            return torch.zeros(n_tgt, dtype=torch.long, device=device)
+        idx = torch.linspace(0, n_src - 1, steps=n_tgt, device=device)
+        idx = torch.floor(idx).to(torch.long).clamp_(0, n_src - 1)
+        return idx
 
-    clip_frames = video_tensor[:clip_frames_count]
-    sync_frames = video_tensor[:sync_frames_count]
+    # --- CLIP stream: target == token count == raw frame count ---
+    clip_idx = uniform_indices(total_frames, target_clip, video_tensor.device)
+    clip_frames = video_tensor.index_select(0, clip_idx)
 
-    clip_frames = clip_frames.permute(0, 3, 1, 2)
-    sync_frames = sync_frames.permute(0, 3, 1, 2)
+    # --- SYNC stream: need RAW_FRAMES = target_sync_tokens + 8 ---
+    sync_raw_needed = max(_SYNC_NUM_FRAMES_PER_SEG, int(target_sync) + _SYNC_OFFSET)
+    sync_idx = uniform_indices(total_frames, sync_raw_needed, video_tensor.device)
+    sync_frames = video_tensor.index_select(0, sync_idx)
+
+    # Move to CPU, CHW, then transform
+    clip_frames = clip_frames.cpu().permute(0, 3, 1, 2)
+    sync_frames = sync_frames.cpu().permute(0, 3, 1, 2)
 
     clip_frames = torch.stack([clip_transform(frame) for frame in clip_frames])
     sync_frames = torch.stack([sync_transform(frame) for frame in sync_frames])
-
-    clip_length_sec = clip_frames.shape[0] / _CLIP_FPS
-    sync_length_sec = sync_frames.shape[0] / _SYNC_FPS
-
-    # if clip_length_sec < duration_sec:
-    #     log.warning(f'Clip video is too short: {clip_length_sec:.2f} < {duration_sec:.2f}')
-    #     log.warning(f'Truncating to {clip_length_sec:.2f} sec')
-    #     duration_sec = clip_length_sec
-
-    # if sync_length_sec < duration_sec:
-    #     log.warning(f'Sync video is too short: {sync_length_sec:.2f} < {duration_sec:.2f}')
-    #     log.warning(f'Truncating to {sync_length_sec:.2f} sec')
-    #     duration_sec = sync_length_sec
-
-    clip_frames = clip_frames[:int(_CLIP_FPS * duration_sec)]
-    sync_frames = sync_frames[:int(_SYNC_FPS * duration_sec)]
 
     return clip_frames, sync_frames, duration_sec
 
@@ -159,7 +188,7 @@ class MMAudioModelLoader:
                         )
         model = model.eval()
         for name, param in model.named_parameters():
-            # Set tensor to device
+            # Set tensor to offload_device to not consume VRAM early in workflow
             set_module_tensor_to_device(model, name, device=offload_device, dtype=base_dtype, value=mmaudio_sd[name])
         del mmaudio_sd
         log.info(f'Loaded MMAudio model weights from {mmaudio_model_path}')
@@ -318,52 +347,83 @@ class MMAudioSampler:
     CATEGORY = "MMAudio"
 
     def sample(self, mmaudio_model, seed, feature_utils, duration, steps, cfg, prompt, negative_prompt, mask_away_clip, force_offload, images=None):
+        """
+        - Uses seq_cfg to derive the *token* lengths the model expects.
+        - Resamples frames so CLIP tokens == seq_cfg.clip_seq_len,
+        and SYNC TOKENS == seq_cfg.sync_seq_len (by feeding +8 raw frames).
+        - Calls update_seq_lengths with the SAME lengths to avoid asserts.
+        - JIT-moves models to GPU; offloads after.
+        """
         device = mm.get_torch_device()
         offload_device = mm.unet_offload_device()
-        rng = torch.Generator(device=device)
-        rng.manual_seed(seed)
+        rng = torch.Generator(device=device).manual_seed(seed)
 
-        seq_cfg = mmaudio_model.seq_cfg
-       
+        # 1) Fix duration in config; derive target token counts from cfg
+        seq_cfg: SequenceConfig = mmaudio_model.seq_cfg
+        seq_cfg.duration = float(duration)
+
+        target_clip_tokens = int(seq_cfg.clip_seq_len)   # e.g., 64 for 8s, 80 for 10s
+        target_sync_tokens = int(seq_cfg.sync_seq_len)   # e.g., 192 for 8s, 242 for 10s
+
+        # 2) Prepare visual inputs
         if images is not None:
-            images = images.to(device=device)
-            clip_frames, sync_frames, duration = process_video_tensor(images, duration)
-            print("clip_frames", clip_frames.shape, "sync_frames", sync_frames.shape, "duration", duration)
+            images = images.to(device=device, non_blocking=True)
+
+            # Resample across the FULL span; note sync path feeds +8 raw frames
+            clip_frames, sync_frames, duration = process_video_tensor(
+                images, duration,
+                target_clip=target_clip_tokens,
+                target_sync=target_sync_tokens,
+            )
+            log.info(
+                f"Prepared visual streams: "
+                f"CLIP(raw)={clip_frames.shape[0]} (tokens={target_clip_tokens}) @8fps, "
+                f"SYNC(raw)={sync_frames.shape[0]} (tokens={target_sync_tokens}) @25fps, "
+                f"duration={duration:.3f}s"
+            )
+
             if mask_away_clip:
                 clip_frames = None
             else:
-                clip_frames = clip_frames.unsqueeze(0)
-            sync_frames = sync_frames.unsqueeze(0)
+                clip_frames = clip_frames.unsqueeze(0)  # (1, T_clip_raw, C, H, W)
+            sync_frames = sync_frames.unsqueeze(0)      # (1, T_sync_raw, C, H, W)
         else:
             clip_frames = None
             sync_frames = None
-        
-        seq_cfg.duration = duration
-        mmaudio_model.update_seq_lengths(seq_cfg.latent_seq_len, seq_cfg.clip_seq_len, seq_cfg.sync_seq_len)
 
+        # 3) Update model to EXPECT these token lengths
+        mmaudio_model.update_seq_lengths(
+            seq_cfg.latent_seq_len,      # audio latents (comes from audio cfg/rate)
+            target_clip_tokens,          # CLIP tokens
+            target_sync_tokens           # SYNC tokens
+        )
+
+        # 4) Scheduler + JIT device placement
         scheduler = FlowMatching(min_sigma=0, inference_mode='euler', num_steps=steps)
         feature_utils.to(device)
         mmaudio_model.to(device)
-        audios = generate(clip_frames,
-                      sync_frames, [prompt],
-                      negative_text=[negative_prompt],
-                      feature_utils=feature_utils,
-                      net=mmaudio_model,
-                      fm=scheduler,
-                      rng=rng,
-                      cfg_strength=cfg)
+
+        # 5) Generate
+        audios = generate(
+            clip_frames,
+            sync_frames,
+            [prompt],
+            negative_text=[negative_prompt],
+            feature_utils=feature_utils,
+            net=mmaudio_model,
+            fm=scheduler,
+            rng=rng,
+            cfg_strength=cfg,
+        )
+
+        # 6) Offload if requested
         if force_offload:
             mmaudio_model.to(offload_device)
             feature_utils.to(offload_device)
             mm.soft_empty_cache()
-        waveform = audios.float().cpu()
-        #torchaudio.save("test.wav", waveform, 44100)
-        audio = {
-            "waveform": waveform,
-            "sample_rate": 44100
-        }
 
-        return (audio,)
+        waveform = audios.float().cpu()
+        return ({"waveform": waveform, "sample_rate": 44100},)
         
 NODE_CLASS_MAPPINGS = {
     "MMAudioModelLoader": MMAudioModelLoader,
