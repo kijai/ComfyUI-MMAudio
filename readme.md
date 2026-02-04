@@ -23,3 +23,5 @@ Nvidia bigvganv2 (used with 44k mode)
 https://huggingface.co/nvidia/bigvgan_v2_44khz_128band_512x
 
 is autodownloaded to `ComfyUI/models/mmaudio/nvidia/bigvgan_v2_44khz_128band_512x`
+
+FIX
